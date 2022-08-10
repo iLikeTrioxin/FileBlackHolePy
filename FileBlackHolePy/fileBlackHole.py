@@ -1,74 +1,63 @@
 from json     import loads, dumps
 from math     import ceil
 from os.path  import abspath, basename, getsize
-from colors   import log, bcolors
+from random   import randint
+
 import aiohttp
 import asyncio
-import random
-
-aiohttpSession = None
-
-
-async def initLib():
-    global aiohttpSession
-
-    connector = aiohttp.TCPConnector(limit=4)
-    jar       = aiohttp.DummyCookieJar()
-
-    aiohttpSession = aiohttp.ClientSession(
-        connector=connector,
-        cookie_jar=jar
-    )
-
-
-async def destroyLib():
-    global aiohttpSession
-    if aiohttpSession is not None: await aiohttpSession.close()
 
 
 class FileBlackHole:
     # https://fileblackhole.000webhostapp.com/API.php
     apiUrl             = 'https://fileblackhole.yukiteru.xyz/API.php'
     chunkSize          = 1000000
+    headers            = None
     sessionID          = None
+    aiohttpSession     = None
     triesPerConnection = 3
 
     def __init__(self, chunkSize=1000000, tpc=6):
         self.triesPerConnection = tpc
         self.chunkSize          = chunkSize
 
+    async def init(self):
+        connector = aiohttp.TCPConnector(limit=4)
+        jar       = aiohttp.DummyCookieJar()
+
+        self.aiohttpSession = aiohttp.ClientSession(
+            connector=connector,
+            cookie_jar=jar
+        )
+
     async def close(self):
         await self.sendRequest({
             'method': 'killsession'
         })
+        await self.aiohttpSession.close()
 
-    async def sendRequest(self, data):
-        tries = self.triesPerConnection
-        headers = {}
-        x = None
+    async def sendRequest(self, data: dict, tries: int = 6) -> dict | None:
+        if self.headers is None: return None
 
-        if self.sessionID is not None: headers['Cookie'] = f"PHPSESSID={self.sessionID}"
+        try:
+            async with self.aiohttpSession.post(self.apiUrl, headers=self.headers, data=data) as response:
+                if response.status != 200: raise Exception(f"Server returned status code {response.status}")
 
-        while True:
-            try:
-                async with aiohttpSession.post(self.apiUrl, headers=headers, data=data) as response:
-                    if response.status == 200:
-                        x = loads(await response.text())
-                        if x['exitCode'] != 0:
-                            log(f"[!] Request failed on server side with code {x['exitCode']}. (HEADERS: {dumps(headers)}; DATA: {dumps(data)}; RESPONSE: {dumps(x)})", [bcolors.FAIL])
-                            raise Exception("Request failed")
-                        return x
-            except:
-                pass
+                x = loads(await response.text())
+                if x['exitCode'] == 0: return x
 
-            await asyncio.sleep(random.randint(1, 10))
+                raise Exception(
+                    f"Request failed on server side with code {x['exitCode']}. ("
+                    f"HEADERS: {dumps(self.headers)}; "
+                    f"DATA: {dumps(data)}; "
+                    f"RESPONSE: {dumps(x)})"
+                )
+        except (Exception,) as e:
+            print(e)
+            if tries == 0: return None
+            await asyncio.sleep(randint(1, 10))
+            return await self.sendRequest(data, tries-1)
 
-            if tries == 1:
-                return x
-
-            tries -= 1
-
-    async def createSession(self):
+    async def createSession(self) -> int | None:
         result = await self.sendRequest({
             'method': 'createSession'
         })
@@ -77,48 +66,53 @@ class FileBlackHole:
         elif result['exitCode'] != 0: return None
 
         self.sessionID = result['result']['sid']
+        self.headers = {'Cookie': f"PHPSESSID={self.sessionID}"}
 
-    async def uploadFileChunk(self, filename, data, chunks, chunk):
+    async def uploadFileChunk(self, filename: str, data, chunks: int, chunk : int) -> dict | None:
         result = await self.sendRequest({
             "method": "uploadFileChunk",
-            "name"  : str(filename),
-            "chunks": str(chunks),
-            "chunk" : str(chunk),
-            "file"  :     data
+            "name"  : filename,
+            "chunks": chunks,
+            "chunk" : chunk,
+            "file"  : data
         })
 
         if isinstance(result, int):
-            log(f"[!] Upload chunk for {filename} failed with status code {result}. (SID: {self.sessionID})", [bcolors.FAIL])
+            print(f"[!] Upload chunk for {filename} failed with status code {result}. (SID: {self.sessionID})")
             return None
         if result is None:
-            log(f"[!] Upload chunk for {filename} failed. Couldn't connect with server. (SID: {self.sessionID})", [bcolors.FAIL])
+            print(f"[!] Upload chunk for {filename} failed. Couldn't connect with server. (SID: {self.sessionID})")
             return None
         elif result['exitCode'] != 0:
-            log(f"[!] Upload chunk for {filename} failed. (SID: {self.sessionID}; CODE: {result['exitCode']}; RESPONSE: {result['result']})", [bcolors.FAIL])
+            print(f"[!] Upload chunk for {filename} failed. ("
+                  f"SID: {self.sessionID}; "
+                  f"CODE: {result['exitCode']}; "
+                  f"RESPONSE: {result['result']}"
+                  f")")
             return None
 
         return result
 
-    async def declareUpload(self, filename, size):
+    async def declareUpload(self, filename: str, size: int) -> int:
         result = await self.sendRequest({
-            "method"  :  "startUpload",
-            "size"    : str(size),
-            "filename": str(filename)
+            "method"  : "startUpload",
+            "size"    : size,
+            "filename": filename
         })
 
         if isinstance(result, int):
-            log(f"[!] Declare upload for {filename} failed with status code {result}. (SID: {self.sessionID})", [bcolors.FAIL])
+            print(f"[!] Declare upload for {filename} failed with status code {result}. (SID: {self.sessionID})")
             return 1
         elif result is None:
-            log(f"[!] Declare upload for {filename} failed with unknown status code. (SID: {self.sessionID})", [bcolors.FAIL])
+            print(f"[!] Declare upload for {filename} failed with unknown status code. (SID: {self.sessionID})")
             return 3
         elif result['exitCode'] != 0:
-            log(f"[!] Declare upload for {filename} exited with code {result['exitCode']}. (SID: {self.sessionID})", [bcolors.FAIL])
+            print(f"[!] Declare upload for {filename} exited with code {result['exitCode']}. (SID: {self.sessionID})")
             return 2
 
         return 0
 
-    async def uploadFile(self, path):
+    async def uploadFile(self, path: str) -> dict | None:
         if path is None: return None
         
         path   = abspath (path)
